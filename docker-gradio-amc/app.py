@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 import gradio as gr
 import pandas as pd
+from PIL import Image, ImageDraw
 
 from amc_wrapper import AMCCommandRunner
 from amc_project import AMCProject
@@ -426,7 +427,144 @@ def analyse_scans(n_procs, threshold, multiple):
 
 
 # ============================================================
-# Onglet 5 — Association
+# Onglet 5 — Vérification
+# ============================================================
+
+def _box_is_ticked(box, seuil=0.15):
+    """Détermine si une case est cochée (manual prioritaire, sinon black/total)."""
+    manual = box["manual"]
+    if manual is not None and manual >= 0:
+        return manual == 1
+    total = box["total"] or 1
+    black = box["black"] or 0
+    return (black / total) > seuil
+
+
+def render_annotated_scan(scan_path, boxes):
+    """Dessine des rectangles colorés sur le scan pour chaque case réponse."""
+    img = Image.open(scan_path).convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+    for box in boxes:
+        is_ticked = _box_is_ticked(box)
+        fill = (0, 200, 0, 80) if is_ticked else (200, 0, 0, 80)
+        border = (0, 200, 0, 255) if is_ticked else (200, 0, 0, 255)
+        has_manual = box["manual"] is not None and box["manual"] >= 0
+        width = 4 if has_manual else 2
+        coords = [box["x1"], box["y1"], box["x2"], box["y2"]]
+        draw.rectangle(coords, fill=fill, outline=border, width=width)
+    img = Image.alpha_composite(img, overlay)
+    return img.convert("RGB")
+
+
+def _boxes_to_dataframe(boxes):
+    """Convertit les boxes en DataFrame pour affichage."""
+    rows = []
+    for box in boxes:
+        total = box["total"] or 1
+        black = box["black"] or 0
+        pct = round(100 * black / total, 1)
+        is_ticked = _box_is_ticked(box)
+        manual = box["manual"]
+        if manual is not None and manual >= 0:
+            etat = "Coché (manuel)" if manual == 1 else "Non-coché (manuel)"
+        else:
+            etat = "Coché (auto)" if is_ticked else "Non-coché (auto)"
+        rows.append({
+            "Question": box["question"],
+            "Réponse": box["answer"],
+            "Noircissement %": pct,
+            "État": etat,
+        })
+    return pd.DataFrame(rows) if rows else pd.DataFrame(
+        columns=["Question", "Réponse", "Noircissement %", "État"]
+    )
+
+
+def load_verification_pages():
+    """Remplit le dropdown avec les pages scannées disponibles."""
+    db = _db()
+    if not db:
+        return gr.update(choices=[], value=None)
+    pages = db.get_captured_pages()
+    if not pages:
+        return gr.update(choices=[], value=None)
+    choices = []
+    for p in pages:
+        label = f"Étudiant {p['student']} - Page {p['page']} (copie {p['copy']})"
+        choices.append(label)
+    return gr.update(choices=choices, value=choices[0] if choices else None)
+
+
+def _parse_page_selection(sel):
+    """Parse 'Étudiant X - Page Y (copie Z)' → (student, page, copy)."""
+    if not sel:
+        return None, None, None
+    m = re.match(
+        r"Étudiant\s+(\d+)\s*-\s*Page\s+(\d+)\s*\(copie\s+(\d+)\)", sel
+    )
+    if not m:
+        return None, None, None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def load_page_image(page_selection):
+    """Charge le scan annoté et le tableau des cases."""
+    db = _db()
+    if not db:
+        return None, "Aucun projet ouvert.", None
+    student, page, copy = _parse_page_selection(page_selection)
+    if student is None:
+        return None, "Sélectionnez une page.", None
+    scan_path = db.get_scan_path(student, page, copy)
+    if not scan_path or not os.path.exists(scan_path):
+        return None, f"Scan introuvable : {scan_path}", None
+    boxes = db.get_page_boxes(student, page, copy)
+    if not boxes:
+        return None, "Aucune case détectée sur cette page.", None
+    img = render_annotated_scan(scan_path, boxes)
+    df = _boxes_to_dataframe(boxes)
+    return img, f"{len(boxes)} case(s) affichée(s).", df
+
+
+def on_image_click(page_selection, evt: gr.SelectData):
+    """Reçoit les coordonnées du clic, toggle la case, regénère l'image."""
+    db = _db()
+    if not db:
+        return None, "Aucun projet ouvert.", None
+    student, page, copy = _parse_page_selection(page_selection)
+    if student is None:
+        return None, "Aucune page sélectionnée.", None
+    x, y = evt.index
+    zoneid = db.toggle_box_at(student, page, copy, x, y)
+    if zoneid is None:
+        # Pas de case assez proche, recharger sans changement
+        scan_path = db.get_scan_path(student, page, copy)
+        boxes = db.get_page_boxes(student, page, copy)
+        img = render_annotated_scan(scan_path, boxes) if scan_path and boxes else None
+        df = _boxes_to_dataframe(boxes) if boxes else None
+        return img, "Aucune case trouvée à cet endroit.", df
+    # Recharger l'image avec le nouvel état
+    scan_path = db.get_scan_path(student, page, copy)
+    boxes = db.get_page_boxes(student, page, copy)
+    img = render_annotated_scan(scan_path, boxes)
+    df = _boxes_to_dataframe(boxes)
+    # Trouver la case modifiée pour le message
+    changed = next((b for b in boxes if b["zoneid"] == zoneid), None)
+    if changed:
+        is_ticked = _box_is_ticked(changed)
+        state_str = "coché" if is_ticked else "non-coché"
+        info = (
+            f"Question {changed['question']}, réponse {changed['answer']} : "
+            f"→ {state_str} (manuel)"
+        )
+    else:
+        info = f"Zone {zoneid} modifiée."
+    return img, info, df
+
+
+# ============================================================
+# Onglet 6 — Association
 # ============================================================
 
 def upload_student_list(file):
@@ -464,7 +602,7 @@ def associate_students(list_key, notes_id):
 
 
 # ============================================================
-# Onglet 6 — Notation
+# Onglet 7 — Notation
 # ============================================================
 
 def detect_correction_copy(correction_state):
@@ -517,7 +655,7 @@ def calculate_grades(notemax, grain, arrondi, seuil, postcorrect,
 
 
 # ============================================================
-# Onglet 7 — Export
+# Onglet 8 — Export
 # ============================================================
 
 def export_results(fmt):
@@ -780,8 +918,44 @@ def build_ui():
                 outputs=[analyse_log, analyse_stats],
             )
 
-        # --- Onglet 5 : Association ---
-        with gr.Tab("5. Association"):
+        # --- Onglet 5 : Vérification ---
+        with gr.Tab("5. Vérification"):
+            with gr.Row():
+                page_selector = gr.Dropdown(
+                    label="Page scannée",
+                    choices=[],
+                    interactive=True,
+                )
+                btn_load_page = gr.Button("Charger la page")
+                btn_refresh_pages = gr.Button("Rafraîchir la liste")
+            scan_image = gr.Image(
+                label="Scan annoté (cliquez sur une case pour toggler)",
+                interactive=False,
+            )
+            verif_info = gr.Textbox(
+                label="Information", interactive=False
+            )
+            boxes_table = gr.Dataframe(
+                label="Cases de la page",
+            )
+
+            btn_refresh_pages.click(
+                load_verification_pages,
+                outputs=[page_selector],
+            )
+            btn_load_page.click(
+                load_page_image,
+                inputs=[page_selector],
+                outputs=[scan_image, verif_info, boxes_table],
+            )
+            scan_image.select(
+                on_image_click,
+                inputs=[page_selector],
+                outputs=[scan_image, verif_info, boxes_table],
+            )
+
+        # --- Onglet 6 : Association ---
+        with gr.Tab("6. Association"):
             student_upload = gr.File(
                 label="Upload liste étudiants (CSV)",
                 file_types=[".csv"],
@@ -816,8 +990,8 @@ def build_ui():
                 outputs=[assoc_log, assoc_stats],
             )
 
-        # --- Onglet 6 : Notation ---
-        with gr.Tab("6. Notation"):
+        # --- Onglet 7 : Notation ---
+        with gr.Tab("7. Notation"):
             with gr.Row():
                 notemax = gr.Number(label="Note max", value=20)
                 grain = gr.Number(label="Grain", value=0.5)
@@ -868,8 +1042,8 @@ def build_ui():
                 outputs=[grade_log, results_table, questions_table],
             )
 
-        # --- Onglet 7 : Export ---
-        with gr.Tab("7. Export"):
+        # --- Onglet 8 : Export ---
+        with gr.Tab("8. Export"):
             export_fmt = gr.Dropdown(
                 label="Format d'export",
                 choices=["CSV", "ODS", "XLSX"],

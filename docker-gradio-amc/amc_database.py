@@ -17,6 +17,7 @@
 
 """Lecture des bases de données SQLite d'AMC pour afficher résultats et stats."""
 
+import math
 import os
 import sqlite3
 
@@ -234,5 +235,177 @@ class AMCDatabase:
             return pd.DataFrame(
                 columns=["question", "correct", "total", "pct"]
             )
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Vérification OMR — lecture/écriture capture_zone
+    # ------------------------------------------------------------------
+
+    def get_captured_pages(self):
+        """Liste des pages scannées (student, page, copy, src).
+
+        Returns:
+            Liste de dicts ou liste vide.
+        """
+        conn = self._connect("capture.sqlite")
+        if not conn:
+            return []
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT student, page, copy, src FROM capture_page "
+                "WHERE timestamp_auto > 0 ORDER BY student, page, copy"
+            )
+            rows = cur.fetchall()
+            return [
+                {"student": r[0], "page": r[1], "copy": r[2], "src": r[3]}
+                for r in rows
+            ]
+        except sqlite3.OperationalError:
+            return []
+        finally:
+            conn.close()
+
+    def get_page_boxes(self, student, page, copy):
+        """Cases réponse d'une page avec positions et état.
+
+        Returns:
+            Liste de dicts avec zoneid, question, answer, total, black,
+            manual, x1, y1, x2, y2.
+        """
+        conn = self._connect("capture.sqlite")
+        if not conn:
+            return []
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT cz.zoneid, cz.id_a AS question, cz.id_b AS answer, "
+                "       cz.total, cz.black, cz.manual, "
+                "       cp1.x AS x1, cp1.y AS y1, "
+                "       cp2.x AS x2, cp2.y AS y2 "
+                "FROM capture_zone cz "
+                "JOIN capture_position cp1 "
+                "  ON cp1.zoneid = cz.zoneid AND cp1.corner = 1 "
+                "  AND cp1.type = cz.type "
+                "JOIN capture_position cp2 "
+                "  ON cp2.zoneid = cz.zoneid AND cp2.corner = 3 "
+                "  AND cp2.type = cz.type "
+                "WHERE cz.student = ? AND cz.page = ? AND cz.copy = ? "
+                "  AND cz.type = 4 "
+                "ORDER BY cz.id_a, cz.id_b",
+                (student, page, copy),
+            )
+            cols = [
+                "zoneid", "question", "answer", "total", "black",
+                "manual", "x1", "y1", "x2", "y2",
+            ]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+        except sqlite3.OperationalError:
+            return []
+        finally:
+            conn.close()
+
+    def set_zone_manual(self, zoneid, value):
+        """Met à jour le champ manual d'une zone (0, 1 ou -1).
+
+        Args:
+            zoneid: Identifiant de la zone.
+            value: -1 (auto), 0 (forcé non-coché), 1 (forcé coché).
+        """
+        conn = self._connect("capture.sqlite")
+        if not conn:
+            return
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE capture_zone SET manual = ? WHERE zoneid = ?",
+                (value, zoneid),
+            )
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            conn.close()
+
+    def toggle_box_at(self, student, page, copy, x, y, threshold=40):
+        """Trouve la case la plus proche de (x, y) et toggle son état.
+
+        Returns:
+            zoneid modifié ou None si aucune case assez proche.
+        """
+        boxes = self.get_page_boxes(student, page, copy)
+        if not boxes:
+            return None
+
+        best = None
+        best_dist = float("inf")
+        for box in boxes:
+            cx = (box["x1"] + box["x2"]) / 2
+            cy = (box["y1"] + box["y2"]) / 2
+            dist = math.hypot(x - cx, y - cy)
+            # Accepter aussi si le clic est à l'intérieur du rectangle
+            inside = (
+                min(box["x1"], box["x2"]) <= x <= max(box["x1"], box["x2"])
+                and min(box["y1"], box["y2"]) <= y <= max(box["y1"], box["y2"])
+            )
+            if inside:
+                dist = 0
+            if dist < best_dist:
+                best_dist = dist
+                best = box
+
+        if best is None or best_dist > threshold:
+            return None
+
+        # Déterminer l'état actuel
+        manual = best["manual"]
+        if manual is not None and manual >= 0:
+            is_ticked = manual == 1
+        else:
+            total = best["total"] or 1
+            black = best["black"] or 0
+            is_ticked = (black / total) > 0.15
+
+        # Toggle
+        new_val = 0 if is_ticked else 1
+        self.set_zone_manual(best["zoneid"], new_val)
+        return best["zoneid"]
+
+    def get_scan_path(self, student, page, copy):
+        """Chemin du fichier scan depuis capture_page.src.
+
+        Résout les raccourcis %PROJET etc.
+
+        Returns:
+            Chemin absolu du scan ou None.
+        """
+        conn = self._connect("capture.sqlite")
+        if not conn:
+            return None
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT src FROM capture_page "
+                "WHERE student = ? AND page = ? AND copy = ?",
+                (student, page, copy),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            src = row[0]
+            # Résoudre %PROJET → répertoire parent de data/
+            project_dir = os.path.dirname(self.data_dir)
+            src = src.replace("%PROJET/", project_dir + "/")
+            src = src.replace("%PROJET", project_dir)
+            if os.path.isabs(src) and os.path.exists(src):
+                return src
+            # Essayer relatif au projet
+            candidate = os.path.join(project_dir, src)
+            if os.path.exists(candidate):
+                return candidate
+            return src
+        except sqlite3.OperationalError:
+            return None
         finally:
             conn.close()
