@@ -23,10 +23,6 @@ lint:syntax:
     - python -m py_compile amc_database.py
     - python -m py_compile amc_project.py
     - python -m py_compile amc_wrapper.py
-  rules:
-    - changes:
-        - "*.py"
-        - "tests/**/*.py"
 
 # -----------------------------------------------------------
 # Stage 2 : Tests unitaires et intégration
@@ -47,11 +43,6 @@ test:unit:
       - htmlcov/
     expire_in: 7 days
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
-  rules:
-    - changes:
-        - "*.py"
-        - "tests/**/*.py"
-        - "requirements*.txt"
 
 test:python310:
   stage: test
@@ -60,10 +51,6 @@ test:python310:
     - pip install -r requirements.txt -r requirements-test.txt
   script:
     - pytest tests/ -v --tb=short
-  rules:
-    - changes:
-        - "*.py"
-        - "tests/**/*.py"
 
 test:python312:
   stage: test
@@ -72,13 +59,9 @@ test:python312:
     - pip install -r requirements.txt -r requirements-test.txt
   script:
     - pytest tests/ -v --tb=short
-  rules:
-    - changes:
-        - "*.py"
-        - "tests/**/*.py"
 
 # -----------------------------------------------------------
-# Stage 3 : Build Docker
+# Stage 3 : Build Docker (uniquement main / merge requests)
 # -----------------------------------------------------------
 
 build:docker:
