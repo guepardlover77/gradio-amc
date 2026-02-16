@@ -1,9 +1,28 @@
 
 stages:
+  - lint
   - build
   - test
   - package
   - packagetest
+
+# -----------------------------------------------------------
+# Stage lint : docker-gradio-amc — vérification syntaxe
+# -----------------------------------------------------------
+
+gradio:lint:syntax:
+  stage: lint
+  image: python:3.11-slim
+  script:
+    - cd docker-gradio-amc
+    - python -m py_compile app.py
+    - python -m py_compile amc_database.py
+    - python -m py_compile amc_project.py
+    - python -m py_compile amc_wrapper.py
+
+# -----------------------------------------------------------
+# Stage build : AMC
+# -----------------------------------------------------------
 
 build:
   stage: build
@@ -89,6 +108,63 @@ test-portable:
     - cd ../tests/gui/dogtail
     - AMC_PATH=$CI_PROJECT_DIR/portable/AMC/bin/auto-multiple-choice ./blind-tests.sh simple
   allow_failure: true
+
+# -----------------------------------------------------------
+# Tests docker-gradio-amc
+# -----------------------------------------------------------
+
+gradio:test:unit:
+  stage: test
+  image: python:3.11-slim
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  cache:
+    key: "gradio-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .cache/pip/
+  before_script:
+    - pip install -r docker-gradio-amc/requirements.txt -r docker-gradio-amc/requirements-test.txt
+  script:
+    - cd docker-gradio-amc
+    - pytest tests/ -v --tb=short --junitxml=report.xml --cov=. --cov-report=term --cov-report=html:htmlcov
+  artifacts:
+    when: always
+    reports:
+      junit: docker-gradio-amc/report.xml
+    paths:
+      - docker-gradio-amc/htmlcov/
+    expire_in: 7 days
+  coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
+
+gradio:test:python310:
+  stage: test
+  image: python:3.10-slim
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  cache:
+    key: "gradio-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .cache/pip/
+  before_script:
+    - pip install -r docker-gradio-amc/requirements.txt -r docker-gradio-amc/requirements-test.txt
+  script:
+    - cd docker-gradio-amc
+    - pytest tests/ -v --tb=short
+
+gradio:test:python312:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  cache:
+    key: "gradio-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .cache/pip/
+  before_script:
+    - pip install -r docker-gradio-amc/requirements.txt -r docker-gradio-amc/requirements-test.txt
+  script:
+    - cd docker-gradio-amc
+    - pytest tests/ -v --tb=short
 
 pack-ppa:
   stage: package
