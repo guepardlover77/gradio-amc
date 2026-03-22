@@ -5,7 +5,25 @@ import sqlite3
 import pandas as pd
 import pytest
 
-from amc_database import AMCDatabase
+from amc_database import AMCDatabase, DEFAULT_CREM_DIGITS, DEFAULT_CREM_ANSWERS
+
+
+# ============================================================
+# Constantes CREM
+# ============================================================
+
+class TestCremConstants:
+    def test_constants_exported(self):
+        """DEFAULT_CREM_DIGITS et DEFAULT_CREM_ANSWERS sont importables."""
+        assert DEFAULT_CREM_DIGITS == 4
+        assert DEFAULT_CREM_ANSWERS == 10
+
+    def test_get_crem_codes_uses_defaults(self, capture_db_with_crem, project_dir):
+        """get_crem_codes() sans args utilise les constantes par défaut."""
+        db = AMCDatabase(str(project_dir / "data"))
+        codes = db.get_crem_codes()
+        assert (1, 0) in codes
+        assert len(codes[(1, 0)]) == DEFAULT_CREM_DIGITS
 
 
 # ============================================================
@@ -176,6 +194,124 @@ class TestFindCorrectionCopy:
 
 
 # ============================================================
+# get_student_codes
+# ============================================================
+
+class TestGetStudentCodes:
+    def test_with_data(self, scoring_db, project_dir):
+        db = AMCDatabase(str(project_dir / "data"))
+        codes = db.get_student_codes()
+        assert codes == {(1, 0): '12345', (2, 0): '67890'}
+
+    def test_no_db(self, project_dir):
+        db = AMCDatabase(str(project_dir / "data"))
+        codes = db.get_student_codes()
+        assert codes == {}
+
+    def test_no_scoring_code_table(self, project_dir):
+        db_path = project_dir / "data" / "scoring.sqlite"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE scoring_mark "
+            "(student INTEGER, copy INTEGER, total REAL, max REAL, mark REAL)"
+        )
+        conn.commit()
+        conn.close()
+
+        db = AMCDatabase(str(project_dir / "data"))
+        codes = db.get_student_codes()
+        assert codes == {}
+
+    def test_integer_values_converted_to_str(self, project_dir):
+        """Les codes stockés comme entiers doivent être convertis en str."""
+        db_path = project_dir / "data" / "scoring.sqlite"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE scoring_code "
+            "(student INTEGER, copy INTEGER, type TEXT, value, direct INTEGER)"
+        )
+        conn.execute(
+            "INSERT INTO scoring_code VALUES (1, 0, 'student.number', 1234, 0)"
+        )
+        conn.commit()
+        conn.close()
+
+        db = AMCDatabase(str(project_dir / "data"))
+        codes = db.get_student_codes()
+        assert codes == {(1, 0): '1234'}
+        assert isinstance(codes[(1, 0)], str)
+
+    def test_null_values_excluded(self, project_dir):
+        """Les codes NULL doivent être exclus."""
+        db_path = project_dir / "data" / "scoring.sqlite"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE scoring_code "
+            "(student INTEGER, copy INTEGER, value TEXT)"
+        )
+        conn.execute("INSERT INTO scoring_code VALUES (1, 0, '1234')")
+        conn.execute("INSERT INTO scoring_code VALUES (2, 0, NULL)")
+        conn.commit()
+        conn.close()
+
+        db = AMCDatabase(str(project_dir / "data"))
+        codes = db.get_student_codes()
+        assert (1, 0) in codes
+        assert (2, 0) not in codes
+
+
+# ============================================================
+# get_crem_codes
+# ============================================================
+
+class TestGetCremCodes:
+    def test_no_db(self, project_dir):
+        db = AMCDatabase(str(project_dir / "data"))
+        assert db.get_crem_codes() == {}
+
+    def test_with_crem_data(self, capture_db_with_crem, project_dir):
+        db = AMCDatabase(str(project_dir / "data"))
+        codes = db.get_crem_codes()
+        assert (1, 0) in codes
+        assert codes[(1, 0)] == "1234"
+
+    def test_no_crem_questions(self, capture_db, project_dir):
+        """Questions with only 2 answers are not CREM."""
+        db = AMCDatabase(str(project_dir / "data"))
+        codes = db.get_crem_codes()
+        assert codes == {}
+
+    def test_incomplete_crem(self, project_dir):
+        """Only 3 CREM questions (not 4) → no code."""
+        db_path = project_dir / "data" / "capture.sqlite"
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.cursor()
+        cur.executescript("""
+            CREATE TABLE capture_zone (
+                zoneid INTEGER PRIMARY KEY AUTOINCREMENT,
+                student INTEGER, page INTEGER, copy INTEGER,
+                type INTEGER, id_a INTEGER, id_b INTEGER,
+                total REAL, black REAL, manual INTEGER DEFAULT -1
+            );
+        """)
+        # Only 3 questions with 10 answers
+        for q in range(1, 4):
+            for a in range(1, 11):
+                black = 800 if a == q else 100
+                cur.execute(
+                    "INSERT INTO capture_zone (student, page, copy, type, "
+                    "id_a, id_b, total, black, manual) "
+                    "VALUES (1, 1, 0, 4, ?, ?, 1000, ?, -1)",
+                    (q, a, black),
+                )
+        conn.commit()
+        conn.close()
+        db = AMCDatabase(str(project_dir / "data"))
+        codes = db.get_crem_codes()
+        assert codes == {}
+
+
+# ============================================================
 # get_captured_pages (nouveau — onglet Vérification)
 # ============================================================
 
@@ -277,6 +413,7 @@ class TestGetPageBoxes:
             );
         """)
         # Type 4 (box) — doit apparaître
+        # capture_position.type=2 = coordonnées image (utilisé par AMC)
         conn.execute(
             "INSERT INTO capture_zone "
             "(student, page, copy, type, id_a, id_b, total, black, manual) "
@@ -284,10 +421,10 @@ class TestGetPageBoxes:
         )
         z1 = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.execute(
-            "INSERT INTO capture_position VALUES (?, 1, 4, 10, 10)", (z1,)
+            "INSERT INTO capture_position VALUES (?, 1, 2, 10, 10)", (z1,)
         )
         conn.execute(
-            "INSERT INTO capture_position VALUES (?, 3, 4, 30, 30)", (z1,)
+            "INSERT INTO capture_position VALUES (?, 3, 2, 30, 30)", (z1,)
         )
         # Type 1 (name) — ne doit PAS apparaître
         conn.execute(

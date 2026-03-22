@@ -18,6 +18,7 @@
 """Gestion des projets AMC."""
 
 import os
+import re
 import shutil
 import sqlite3
 import zipfile
@@ -272,13 +273,15 @@ class AMCProject:
     @staticmethod
     def _db_has_rows(data_dir, db_name, table_name):
         """Vérifie qu'une table SQLite contient des données."""
+        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', table_name):
+            return False
         path = os.path.join(data_dir, db_name)
         if not os.path.exists(path):
             return False
         try:
             conn = sqlite3.connect(path)
             cur = conn.cursor()
-            cur.execute(f"SELECT COUNT(*) FROM {table_name}")
+            cur.execute(f'SELECT COUNT(*) FROM "{table_name}"')
             count = cur.fetchone()[0]
             conn.close()
             return count > 0

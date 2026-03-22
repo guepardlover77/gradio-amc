@@ -242,3 +242,41 @@ class TestGetPdfPath:
     def test_no_pdf(self, project_dir):
         proj = AMCProject(str(project_dir))
         assert proj.get_pdf_path() is None
+
+
+# ============================================================
+# _db_has_rows — SQL injection protection
+# ============================================================
+
+class TestDbHasRowsSqlInjection:
+    def test_rejects_semicolon(self, project_dir):
+        data_dir = str(project_dir / "data")
+        assert AMCProject._db_has_rows(data_dir, "layout.sqlite", "foo;DROP TABLE x") is False
+
+    def test_rejects_spaces(self, project_dir):
+        data_dir = str(project_dir / "data")
+        assert AMCProject._db_has_rows(data_dir, "layout.sqlite", "foo bar") is False
+
+    def test_rejects_quotes(self, project_dir):
+        data_dir = str(project_dir / "data")
+        assert AMCProject._db_has_rows(data_dir, "layout.sqlite", 'foo"bar') is False
+
+    def test_rejects_dash_dash(self, project_dir):
+        data_dir = str(project_dir / "data")
+        assert AMCProject._db_has_rows(data_dir, "layout.sqlite", "foo--comment") is False
+
+    def test_accepts_valid_name(self, project_dir, layout_db):
+        data_dir = str(project_dir / "data")
+        assert AMCProject._db_has_rows(data_dir, "layout.sqlite", "layout_page") is True
+
+    def test_accepts_underscore_prefix(self, project_dir, layout_db):
+        data_dir = str(project_dir / "data")
+        # Valid identifier starting with underscore — the table doesn't exist
+        # but the name passes validation, so it returns False (no rows), not
+        # rejected outright.
+        result = AMCProject._db_has_rows(data_dir, "layout.sqlite", "_valid_name")
+        assert result is False  # table doesn't exist, but name is valid
+
+    def test_rejects_number_prefix(self, project_dir):
+        data_dir = str(project_dir / "data")
+        assert AMCProject._db_has_rows(data_dir, "layout.sqlite", "123invalid") is False

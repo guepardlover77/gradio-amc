@@ -17,11 +17,17 @@
 
 """Lecture des bases de données SQLite d'AMC pour afficher résultats et stats."""
 
+import logging
 import math
 import os
 import sqlite3
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_CREM_DIGITS = 4
+DEFAULT_CREM_ANSWERS = 10
 
 
 class AMCDatabase:
@@ -238,6 +244,109 @@ class AMCDatabase:
         finally:
             conn.close()
 
+    def get_student_codes(self):
+        """Codes étudiants remplis sur les copies (table scoring_code).
+
+        Returns:
+            Dict {(student, copy): code_str} ou dict vide.
+        """
+        conn = self._connect("scoring.sqlite")
+        if not conn:
+            return {}
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT student, copy, value FROM scoring_code"
+            )
+            return {
+                (r[0], r[1]): str(r[2]) for r in cur.fetchall()
+                if r[2] is not None
+            }
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+
+    def get_crem_codes(self, num_digits=DEFAULT_CREM_DIGITS,
+                       num_answers=DEFAULT_CREM_ANSWERS):
+        """Reconstitue les codes CREM depuis les cases cochées dans capture_zone.
+
+        Les questions 1..num_digits ayant exactement num_answers réponses sont
+        considérées comme les chiffres du code.  Pour chaque copie
+        (student, copy), le chiffre est déterminé par la réponse cochée
+        (réponse la plus noircie).
+
+        Returns:
+            Dict {(student, copy): code_str} où code_str est de longueur
+            num_digits (ex: "1234").  Les copies sans code complet sont
+            omises.
+        """
+        conn = self._connect("capture.sqlite")
+        if not conn:
+            return {}
+        try:
+            cur = conn.cursor()
+            # Récupérer toutes les zones de type BOX (4) pour les questions
+            # candidates au code CREM.
+            cur.execute(
+                "SELECT student, copy, id_a AS question, id_b AS answer, "
+                "       total, black, manual "
+                "FROM capture_zone "
+                "WHERE type = 4 AND id_a <= ? "
+                "ORDER BY student, copy, id_a, id_b",
+                (num_digits,),
+            )
+            rows = cur.fetchall()
+        except sqlite3.OperationalError:
+            logger.exception("get_crem_codes: erreur SQL")
+            return {}
+        finally:
+            conn.close()
+
+        # Grouper par (student, copy, question)
+        # structure: {(student, copy): {question: [(answer, total, black, manual)]}}
+        from collections import defaultdict
+        copies = defaultdict(lambda: defaultdict(list))
+        for student, copy, question, answer, total, black, manual in rows:
+            copies[(student, copy)][question].append(
+                (answer, total, black, manual)
+            )
+
+        codes = {}
+        for (student, copy), questions in copies.items():
+            # Vérifier que les num_digits questions sont présentes avec
+            # num_answers réponses chacune
+            digits = []
+            valid = True
+            for q in range(1, num_digits + 1):
+                answers = questions.get(q, [])
+                if len(answers) != num_answers:
+                    valid = False
+                    break
+                # Trouver la réponse cochée (la plus noircie)
+                best_answer = None
+                best_ratio = -1
+                for answer, total, black, manual in answers:
+                    if manual is not None and manual >= 0:
+                        if manual == 1 and (best_ratio < 1.0):
+                            best_answer = answer
+                            best_ratio = 1.0
+                    else:
+                        t = total or 1
+                        b = black or 0
+                        ratio = b / t
+                        if ratio > best_ratio:
+                            best_ratio = ratio
+                            best_answer = answer
+                if best_answer is None or best_ratio <= 0.5:
+                    valid = False
+                    break
+                digits.append(str(best_answer))
+            if valid and len(digits) == num_digits:
+                codes[(student, copy)] = "".join(digits)
+
+        return codes
+
     # ------------------------------------------------------------------
     # Vérification OMR — lecture/écriture capture_zone
     # ------------------------------------------------------------------
@@ -250,6 +359,7 @@ class AMCDatabase:
         """
         conn = self._connect("capture.sqlite")
         if not conn:
+            logger.warning("get_captured_pages: capture.sqlite introuvable dans %s", self.data_dir)
             return []
         try:
             cur = conn.cursor()
@@ -258,14 +368,21 @@ class AMCDatabase:
                 "WHERE timestamp_auto > 0 ORDER BY student, page, copy"
             )
             rows = cur.fetchall()
+            logger.info("get_captured_pages: %d page(s)", len(rows))
             return [
                 {"student": r[0], "page": r[1], "copy": r[2], "src": r[3]}
                 for r in rows
             ]
         except sqlite3.OperationalError:
+            logger.exception("get_captured_pages: erreur SQL")
             return []
         finally:
             conn.close()
+
+    # Dans capture_position, le champ ``type`` indique le système de
+    # coordonnées : 1 = layout page, 2 = image scannée.  On utilise le
+    # type 2 pour afficher les rectangles sur le scan.
+    POSITION_TYPE_IMAGE = 2
 
     def get_page_boxes(self, student, page, copy):
         """Cases réponse d'une page avec positions et état.
@@ -276,6 +393,7 @@ class AMCDatabase:
         """
         conn = self._connect("capture.sqlite")
         if not conn:
+            logger.warning("get_page_boxes: capture.sqlite introuvable")
             return []
         try:
             cur = conn.cursor()
@@ -287,21 +405,28 @@ class AMCDatabase:
                 "FROM capture_zone cz "
                 "JOIN capture_position cp1 "
                 "  ON cp1.zoneid = cz.zoneid AND cp1.corner = 1 "
-                "  AND cp1.type = cz.type "
+                "  AND cp1.type = ? "
                 "JOIN capture_position cp2 "
                 "  ON cp2.zoneid = cz.zoneid AND cp2.corner = 3 "
-                "  AND cp2.type = cz.type "
+                "  AND cp2.type = ? "
                 "WHERE cz.student = ? AND cz.page = ? AND cz.copy = ? "
                 "  AND cz.type = 4 "
                 "ORDER BY cz.id_a, cz.id_b",
-                (student, page, copy),
+                (self.POSITION_TYPE_IMAGE, self.POSITION_TYPE_IMAGE,
+                 student, page, copy),
             )
             cols = [
                 "zoneid", "question", "answer", "total", "black",
                 "manual", "x1", "y1", "x2", "y2",
             ]
-            return [dict(zip(cols, row)) for row in cur.fetchall()]
+            rows = cur.fetchall()
+            logger.info(
+                "get_page_boxes: student=%s page=%s copy=%s → %d case(s)",
+                student, page, copy, len(rows),
+            )
+            return [dict(zip(cols, row)) for row in rows]
         except sqlite3.OperationalError:
+            logger.exception("get_page_boxes: erreur SQL")
             return []
         finally:
             conn.close()
@@ -365,7 +490,7 @@ class AMCDatabase:
         else:
             total = best["total"] or 1
             black = best["black"] or 0
-            is_ticked = (black / total) > 0.15
+            is_ticked = (black / total) > 0.5
 
         # Toggle
         new_val = 0 if is_ticked else 1
@@ -392,20 +517,42 @@ class AMCDatabase:
             )
             row = cur.fetchone()
             if not row:
+                logger.warning("get_scan_path: aucune entrée pour student=%s page=%s copy=%s",
+                               student, page, copy)
                 return None
             src = row[0]
-            # Résoudre %PROJET → répertoire parent de data/
+            logger.info("get_scan_path: src brut = %s", src)
             project_dir = os.path.dirname(self.data_dir)
+
+            # Résoudre %PROJET → répertoire du projet
             src = src.replace("%PROJET/", project_dir + "/")
             src = src.replace("%PROJET", project_dir)
+
             if os.path.isabs(src) and os.path.exists(src):
                 return src
+
+            # Chemin absolu Docker (/projects/…) : extraire la partie
+            # relative au projet et la résoudre localement
+            if os.path.isabs(src) and not os.path.exists(src):
+                project_name = os.path.basename(project_dir)
+                marker = "/" + project_name + "/"
+                idx = src.find(marker)
+                if idx >= 0:
+                    rel = src[idx + len(marker):]
+                    candidate = os.path.join(project_dir, rel)
+                    if os.path.exists(candidate):
+                        logger.info("get_scan_path: résolu via nom du projet → %s", candidate)
+                        return candidate
+
             # Essayer relatif au projet
             candidate = os.path.join(project_dir, src)
             if os.path.exists(candidate):
                 return candidate
+
+            logger.warning("get_scan_path: fichier introuvable — résolu=%s", src)
             return src
         except sqlite3.OperationalError:
+            logger.exception("get_scan_path: erreur SQL")
             return None
         finally:
             conn.close()

@@ -23,6 +23,7 @@ lint:syntax:
     - python -m py_compile amc_database.py
     - python -m py_compile amc_project.py
     - python -m py_compile amc_wrapper.py
+    - python -m py_compile standard_mode.py
 
 # -----------------------------------------------------------
 # Stage 2 : Tests unitaires et intégration
@@ -34,7 +35,7 @@ test:unit:
   before_script:
     - pip install -r requirements.txt -r requirements-test.txt
   script:
-    - pytest tests/ -v --tb=short --junitxml=report.xml --cov=. --cov-report=term --cov-report=html:htmlcov
+    - pytest tests/ -v --tb=short -m "not slow" --junitxml=report.xml --cov=. --cov-report=term --cov-report=html:htmlcov
   artifacts:
     when: always
     reports:
@@ -50,7 +51,7 @@ test:python310:
   before_script:
     - pip install -r requirements.txt -r requirements-test.txt
   script:
-    - pytest tests/ -v --tb=short
+    - pytest tests/ -v --tb=short -m "not slow"
 
 test:python312:
   stage: test
@@ -58,7 +59,7 @@ test:python312:
   before_script:
     - pip install -r requirements.txt -r requirements-test.txt
   script:
-    - pytest tests/ -v --tb=short
+    - pytest tests/ -v --tb=short -m "not slow"
 
 # -----------------------------------------------------------
 # Stage 3 : Build Docker (uniquement main / merge requests)

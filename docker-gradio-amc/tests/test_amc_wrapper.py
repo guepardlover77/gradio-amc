@@ -1,6 +1,7 @@
 """Tests pour amc_wrapper.py — wrapper subprocess AMC CLI."""
 
 import os
+import subprocess
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -56,6 +57,42 @@ class TestRun:
         assert "[CMD]" in out
         assert "[CWD] /tmp" in out
 
+    @patch("subprocess.Popen")
+    def test_timeout_handling(self, mock_popen, runner):
+        proc = MagicMock()
+        proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(cmd="test", timeout=5),
+            ("", ""),  # second call after kill
+        ]
+        proc.kill = MagicMock()
+        mock_popen.return_value = proc
+
+        rc, out, err = runner._run(["slow-cmd"], timeout=5)
+        assert rc == -2
+        assert "Timeout" in err
+        assert "5s" in err
+        proc.kill.assert_called_once()
+
+    @patch("subprocess.Popen")
+    def test_custom_timeout_passed(self, mock_popen, runner):
+        proc = MagicMock()
+        proc.communicate.return_value = ("ok", "")
+        proc.returncode = 0
+        mock_popen.return_value = proc
+
+        runner._run(["test"], timeout=42)
+        proc.communicate.assert_called_once_with(timeout=42)
+
+    @patch("subprocess.Popen")
+    def test_default_timeout(self, mock_popen, runner):
+        proc = MagicMock()
+        proc.communicate.return_value = ("ok", "")
+        proc.returncode = 0
+        mock_popen.return_value = proc
+
+        runner._run(["test"])
+        proc.communicate.assert_called_once_with(timeout=600)
+
 
 # ============================================================
 # prepare_document
@@ -88,6 +125,16 @@ class TestPrepareDocument:
         runner.prepare_document(str(tmp_path), "src.tex", 10)
         assert os.path.isdir(os.path.join(str(tmp_path), "data"))
         assert os.path.isdir(os.path.join(str(tmp_path), "_build"))
+
+    @patch("subprocess.Popen")
+    def test_timeout_300(self, mock_popen, runner, tmp_path):
+        proc = MagicMock()
+        proc.communicate.return_value = ("ok", "")
+        proc.returncode = 0
+        mock_popen.return_value = proc
+
+        runner.prepare_document(str(tmp_path), "src.tex", 10)
+        proc.communicate.assert_called_with(timeout=300)
 
 
 # ============================================================
@@ -153,6 +200,40 @@ class TestImportScans:
 
         runner.import_scans(str(tmp_path), ["x.pdf"])
         assert os.path.isdir(os.path.join(str(tmp_path), "scans"))
+
+    @patch("subprocess.Popen")
+    def test_per_file_summary(self, mock_popen, runner, tmp_path):
+        """Le stdout combiné doit contenir un résumé par fichier."""
+        proc = MagicMock()
+        proc.communicate.return_value = ("imported", "")
+        proc.returncode = 0
+        mock_popen.return_value = proc
+
+        rc, out, err = runner.import_scans(
+            str(tmp_path), ["/path/to/scan1.pdf", "/path/to/scan2.pdf"]
+        )
+        assert "Résumé" in out
+        assert "scan1.pdf" in out
+        assert "scan2.pdf" in out
+        assert "OK" in out
+
+    @patch("subprocess.Popen")
+    def test_partial_failure_names_shown(self, mock_popen, runner, tmp_path):
+        """Le fichier en échec doit être identifié par nom dans le résumé."""
+        proc_ok = MagicMock()
+        proc_ok.communicate.return_value = ("ok", "")
+        proc_ok.returncode = 0
+        proc_fail = MagicMock()
+        proc_fail.communicate.return_value = ("", "fail")
+        proc_fail.returncode = 1
+        mock_popen.side_effect = [proc_ok, proc_fail]
+
+        rc, out, err = runner.import_scans(
+            str(tmp_path), ["/scans/good.pdf", "/scans/bad.pdf"]
+        )
+        assert rc == 1
+        assert "good.pdf : OK" in out
+        assert "bad.pdf : ERREUR" in out
 
 
 # ============================================================

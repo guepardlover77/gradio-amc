@@ -25,16 +25,18 @@ class AMCCommandRunner:
     """Exécute les commandes auto-multiple-choice via subprocess."""
 
     AMC_BIN = "auto-multiple-choice"
+    DEFAULT_TIMEOUT = 600  # 10 minutes
 
     def __init__(self):
         pass
 
-    def _run(self, args, cwd=None):
+    def _run(self, args, cwd=None, timeout=None):
         """Exécute une commande AMC et retourne (returncode, stdout, stderr).
 
         La sortie est capturée ligne par ligne pour permettre un suivi
         en temps réel côté appelant.
         """
+        timeout = timeout or self.DEFAULT_TIMEOUT
         cmd = [self.AMC_BIN] + args
         cmd_line = " ".join(cmd)
         try:
@@ -45,10 +47,14 @@ class AMCCommandRunner:
                 cwd=cwd,
                 text=True,
             )
-            stdout, stderr = proc.communicate()
+            stdout, stderr = proc.communicate(timeout=timeout)
             # Prefix with the executed command for debugging
             header = f"[CMD] {cmd_line}\n[CWD] {cwd}\n\n"
             return proc.returncode, header + stdout, stderr
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            return -2, "", f"Timeout après {timeout}s : {cmd_line}"
         except FileNotFoundError:
             return -1, "", f"Commande introuvable : {self.AMC_BIN}\n[CMD] {cmd_line}"
 
@@ -81,7 +87,7 @@ class AMCCommandRunner:
             source,
         ]
 
-        return self._run(args, cwd=project_dir)
+        return self._run(args, cwd=project_dir, timeout=300)
 
     def compute_layout(self, project_dir, calage_path=None):
         """Lit le fichier calage .xy et peuple la base layout.sqlite.
@@ -108,7 +114,7 @@ class AMCCommandRunner:
             "--src", calage_path,
             "--data", data_dir,
         ]
-        return self._run(args, cwd=project_dir)
+        return self._run(args, cwd=project_dir, timeout=60)
 
     def import_scans(self, project_dir, scan_files):
         """Importe les fichiers scannés dans le projet.
@@ -128,13 +134,20 @@ class AMCCommandRunner:
                 "--vector-density", "300",
                 scan_file,
             ]
-            rc, out, err = self._run(args, cwd=project_dir)
-            results.append((rc, out, err))
+            rc, out, err = self._run(args, cwd=project_dir, timeout=120)
+            results.append((os.path.basename(scan_file), rc, out, err))
 
-        # Combine results
-        all_ok = all(r[0] == 0 for r in results)
-        combined_out = "\n".join(r[1] for r in results if r[1])
-        combined_err = "\n".join(r[2] for r in results if r[2])
+        # Résumé par fichier
+        summary_lines = []
+        for name, rc, out, err in results:
+            status = "OK" if rc == 0 else f"ERREUR (code {rc})"
+            summary_lines.append(f"  {name} : {status}")
+        summary = "Résumé :\n" + "\n".join(summary_lines)
+
+        all_ok = all(r[1] == 0 for r in results)
+        combined_out = "\n".join(r[2] for r in results if r[2])
+        combined_out += "\n\n" + summary
+        combined_err = "\n".join(r[3] for r in results if r[3])
         return 0 if all_ok else 1, combined_out, combined_err
 
     def analyse_scans(self, project_dir, n_procs=4, threshold=0.15,
@@ -173,7 +186,7 @@ class AMCCommandRunner:
             args += ["--multiple"]
         args += scan_images
 
-        return self._run(args, cwd=project_dir)
+        return self._run(args, cwd=project_dir, timeout=600)
 
     def auto_associate(self, project_dir, student_list, list_key="ID",
                        notes_id="id"):
@@ -193,7 +206,7 @@ class AMCCommandRunner:
             "--liste-key", list_key,
             "--notes-id", notes_id,
         ]
-        return self._run(args, cwd=project_dir)
+        return self._run(args, cwd=project_dir, timeout=60)
 
     def calculate_grades(self, project_dir, seuil=0.15, grain=0.5,
                          arrondi="n", notemax=20, notemin=0,
@@ -225,7 +238,7 @@ class AMCCommandRunner:
                 "--postcorrect-student", str(int(postcorrect_student)),
                 "--postcorrect-copy", str(int(postcorrect_copy)),
             ]
-        return self._run(args, cwd=project_dir)
+        return self._run(args, cwd=project_dir, timeout=120)
 
     def export_results(self, project_dir, output_file, module="CSV",
                        student_list=None):
@@ -251,4 +264,4 @@ class AMCCommandRunner:
         if student_list:
             args += ["--fich-noms", student_list]
 
-        return self._run(args, cwd=project_dir)
+        return self._run(args, cwd=project_dir, timeout=120)
